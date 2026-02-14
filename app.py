@@ -32,6 +32,23 @@ for var in ("API_KEY", "AZURE_SPEECH_KEY", "AZURE_AVATAR_ENDPOINT",
 
 app = Flask(__name__)
 
+# ── Available models & voices ────────────────────────────────────────────
+AVATARS = {
+    "harry": ["business", "casual", "youthful"],
+    "jeff": ["business", "formal"],
+    "lisa": ["casual-sitting", "graceful-sitting", "graceful-standing", "technical-sitting", "technical-standing"],
+    "lori": ["casual", "graceful", "formal"],
+    "max": ["business", "casual", "formal"],
+    "meg": ["formal", "casual", "business"],
+}
+
+VOICES = {
+    "female": ["th-TH-PremwadeeNeural", "th-TH-AcharaNeural"],
+    "male": ["th-TH-NiwatNeural"],
+}
+
+ALL_VOICES = [v for vs in VOICES.values() for v in vs]
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 def _azure_headers():
@@ -41,19 +58,20 @@ def _azure_headers():
     }
 
 
-def create_avatar_job(text: str) -> str:
+def create_avatar_job(text: str, voice: str = "th-TH-NiwatNeural",
+                     character: str = "harry", style: str = "casual") -> str:
     """Submit a batch avatar synthesis job. Returns the job ID."""
     job_id = str(uuid.uuid4())
     url = f"{AVATAR_ENDPOINT}/avatar/batchsyntheses/{job_id}?api-version={API_VERSION}"
 
     payload = {
         "inputKind": "PlainText",
-        "synthesisConfig": {"voice": "th-TH-NiwatNeural"},
+        "synthesisConfig": {"voice": voice},
         "customVoices": {},
         "inputs": [{"content": text}],
         "avatarConfig": {
-            "talkingAvatarCharacter": "lisa",
-            "talkingAvatarStyle": "casual-sitting",
+            "talkingAvatarCharacter": character,
+            "talkingAvatarStyle": style,
             "customized": False,
             "videoFormat": "mp4",
             "videoCodec": "h264",
@@ -106,11 +124,12 @@ def download_file(url: str) -> str:
 
 
 def upload_to_cloudinary(file_path: str) -> str:
-    """Upload a video file to Cloudinary. Returns the secure URL."""
+    """Upload a video file to Cloudinary as restricted. Returns the secure URL."""
     result = cloudinary.uploader.upload(
         file_path,
         resource_type="video",
         folder="avatar_videos",
+        type="authenticated",
     )
     return result["secure_url"]
 
@@ -129,9 +148,23 @@ def generate_avatar():
     if not text:
         return jsonify({"error": "Missing 'text' field"}), 400
 
+    voice = data.get("voice", "th-TH-NiwatNeural")
+    character = data.get("talkingAvatarCharacter", "harry")
+    style = data.get("talkingAvatarStyle", "casual")
+
+    # --- Validate voice ---
+    if voice not in ALL_VOICES:
+        return jsonify({"error": f"Invalid voice '{voice}'. See GET /voices for options."}), 400
+
+    # --- Validate avatar character & style ---
+    if character not in AVATARS:
+        return jsonify({"error": f"Invalid character '{character}'. See GET /models for options."}), 400
+    if style not in AVATARS[character]:
+        return jsonify({"error": f"Invalid style '{style}' for character '{character}'. Valid: {AVATARS[character]}"}), 400
+
     try:
         # 1. Submit Azure avatar job
-        job_id = create_avatar_job(text)
+        job_id = create_avatar_job(text, voice=voice, character=character, style=style)
 
         # 2. Poll until done
         video_url = poll_avatar_job(job_id)
@@ -162,6 +195,16 @@ def generate_avatar():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/models", methods=["GET"])
+def models():
+    return jsonify({"avatars": AVATARS})
+
+
+@app.route("/voices", methods=["GET"])
+def voices():
+    return jsonify({"voices": VOICES})
 
 
 if __name__ == "__main__":
