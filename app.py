@@ -9,6 +9,7 @@ import cloudinary.uploader
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ for var in ("API_KEY", "AZURE_SPEECH_KEY", "AZURE_AVATAR_ENDPOINT",
         raise RuntimeError(f"Missing env var: {var}")
 
 app = Flask(__name__)
+CORS(app)
 
 # ── Available models & voices ────────────────────────────────────────────
 AVATARS = {
@@ -59,26 +61,33 @@ def _azure_headers():
 
 
 def create_avatar_job(text: str, voice: str = "th-TH-NiwatNeural",
-                     character: str = "harry", style: str = "casual") -> str:
+                     character: str = "harry", style: str = "casual",
+                     background: str | None = None) -> str:
     """Submit a batch avatar synthesis job. Returns the job ID."""
     job_id = str(uuid.uuid4())
     url = f"{AVATAR_ENDPOINT}/avatar/batchsyntheses/{job_id}?api-version={API_VERSION}"
+
+    avatar_config = {
+        "talkingAvatarCharacter": character,
+        "talkingAvatarStyle": style,
+        "customized": False,
+        "videoFormat": "mp4",
+        "videoCodec": "h264",
+        "subtitleType": "soft_embedded",
+        "useBuiltInVoice": False,
+    }
+
+    if background:
+        avatar_config["backgroundImage"] = background
+    else:
+        avatar_config["backgroundColor"] = "#FFFFFFFF"  # solid white
 
     payload = {
         "inputKind": "PlainText",
         "synthesisConfig": {"voice": voice},
         "customVoices": {},
         "inputs": [{"content": text}],
-        "avatarConfig": {
-            "talkingAvatarCharacter": character,
-            "talkingAvatarStyle": style,
-            "customized": False,
-            "videoFormat": "mp4",
-            "videoCodec": "h264",
-            "subtitleType": "soft_embedded",
-            "backgroundColor": "#FFFFFFFF",
-            "useBuiltInVoice": False,
-        },
+        "avatarConfig": avatar_config,
     }
 
     resp = requests.put(url, data=json.dumps(payload), headers=_azure_headers())
@@ -151,6 +160,7 @@ def generate_avatar():
     voice = data.get("voice", "th-TH-NiwatNeural")
     character = data.get("talkingAvatarCharacter", "harry")
     style = data.get("talkingAvatarStyle", "casual")
+    background = data.get("background")  # optional Cloudinary image URL
 
     # --- Validate voice ---
     if voice not in ALL_VOICES:
@@ -164,7 +174,7 @@ def generate_avatar():
 
     try:
         # 1. Submit Azure avatar job
-        job_id = create_avatar_job(text, voice=voice, character=character, style=style)
+        job_id = create_avatar_job(text, voice=voice, character=character, style=style, background=background)
 
         # 2. Poll until done
         video_url = poll_avatar_job(job_id)
