@@ -52,7 +52,7 @@ def create_avatar_job(text: str) -> str:
         "customVoices": {},
         "inputs": [{"content": text}],
         "avatarConfig": {
-            "talkingAvatarCharacter": "en-US-GuyNeural",
+            "talkingAvatarCharacter": "lisa",
             "talkingAvatarStyle": "casual-sitting",
             "customized": False,
             "videoFormat": "mp4",
