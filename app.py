@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import uuid
+import re
 
 import cloudinary
 import cloudinary.uploader
@@ -26,8 +27,14 @@ cloudinary.config(
     secure=True,
 )
 
-for var in ("API_KEY", "AZURE_SPEECH_KEY", "AZURE_AVATAR_ENDPOINT",
-            "CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"):
+for var in (
+    "API_KEY",
+    "AZURE_SPEECH_KEY",
+    "AZURE_AVATAR_ENDPOINT",
+    "CLOUDINARY_CLOUD_NAME",
+    "CLOUDINARY_API_KEY",
+    "CLOUDINARY_API_SECRET",
+):
     if not os.getenv(var):
         raise RuntimeError(f"Missing env var: {var}")
 
@@ -38,7 +45,13 @@ CORS(app)
 AVATARS = {
     "harry": ["business", "casual", "youthful"],
     "jeff": ["business", "formal"],
-    "lisa": ["casual-sitting", "graceful-sitting", "graceful-standing", "technical-sitting", "technical-standing"],
+    "lisa": [
+        "casual-sitting",
+        "graceful-sitting",
+        "graceful-standing",
+        "technical-sitting",
+        "technical-standing",
+    ],
     "lori": ["casual", "graceful", "formal"],
     "max": ["business", "casual", "formal"],
     "meg": ["formal", "casual", "business"],
@@ -60,10 +73,50 @@ def _azure_headers():
     }
 
 
-def create_avatar_job(text: str, voice: str = "th-TH-NiwatNeural",
-                     character: str = "harry", style: str = "casual",
-                     background: str | None = None) -> str:
-    """Submit a batch avatar synthesis job. Returns the job ID."""
+_SSML_HINT_RE = re.compile(r"<\s*(speak|voice|break|prosody|mstts:|audio)\b", re.IGNORECASE)
+
+
+def _looks_like_ssml(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(_SSML_HINT_RE.search(t))
+
+
+def _wrap_ssml_if_needed(content: str, voice: str) -> str:
+    """
+    If user sends full SSML (<speak>...</speak>), keep it.
+    If user sends partial SSML (like 'สวัสดี <break .../> ต่อไป...'), wrap it.
+    """
+    c = (content or "").strip()
+    if not c:
+        return c
+
+    if "<speak" in c.lower():
+        return c
+
+    safe_voice = voice or "th-TH-NiwatNeural"
+    return f"""
+<speak version="1.0" xml:lang="th-TH">
+  <voice name="{safe_voice}">
+    {c}
+  </voice>
+</speak>
+""".strip()
+
+
+def create_avatar_job(
+    text: str,
+    voice: str = "th-TH-NiwatNeural",
+    character: str = "harry",
+    style: str = "casual",
+    background: str | None = None,
+) -> tuple[str, str]:
+    """
+    Submit a batch avatar synthesis job.
+    Returns (job_id, input_kind_used).
+    Auto-detect SSML vs PlainText from `text`.
+    """
     job_id = str(uuid.uuid4())
     url = f"{AVATAR_ENDPOINT}/avatar/batchsyntheses/{job_id}?api-version={API_VERSION}"
 
@@ -82,18 +135,24 @@ def create_avatar_job(text: str, voice: str = "th-TH-NiwatNeural",
     else:
         avatar_config["backgroundColor"] = "#FFFFFFFF"  # solid white
 
+    # ✅ Auto detect SSML
+    is_ssml = _looks_like_ssml(text)
+    input_kind = "SSML" if is_ssml else "PlainText"
+    content = _wrap_ssml_if_needed(text, voice) if is_ssml else text
+
     payload = {
-        "inputKind": "PlainText",
+        "inputKind": input_kind,
         "synthesisConfig": {"voice": voice},
         "customVoices": {},
-        "inputs": [{"content": text}],
+        "inputs": [{"content": content}],
         "avatarConfig": avatar_config,
     }
 
     resp = requests.put(url, data=json.dumps(payload), headers=_azure_headers())
     if resp.status_code >= 400:
         raise RuntimeError(f"Azure job creation failed [{resp.status_code}]: {resp.text}")
-    return job_id
+
+    return job_id, input_kind
 
 
 def poll_avatar_job(job_id: str, timeout: int = 600, interval: int = 5) -> str:
@@ -113,6 +172,7 @@ def poll_avatar_job(job_id: str, timeout: int = 600, interval: int = 5) -> str:
             if not video_url:
                 raise RuntimeError("Job succeeded but no result URL found")
             return video_url
+
         if status == "Failed":
             raise RuntimeError(f"Avatar job failed: {json.dumps(data, indent=2)}")
 
@@ -146,14 +206,15 @@ def upload_to_cloudinary(file_path: str) -> str:
 # ── Routes ───────────────────────────────────────────────────────────────
 @app.route("/generate-avatar", methods=["POST"])
 def generate_avatar():
+    data = request.get_json(silent=True) or {}
+
     # --- Auth ---
-    provided_key = request.headers.get("X-API-Key") or request.json.get("key")
+    provided_key = request.headers.get("X-API-Key") or data.get("key")
     if provided_key != API_KEY:
         return jsonify({"error": "Invalid or missing API key"}), 401
 
     # --- Validate input ---
-    data = request.get_json(silent=True) or {}
-    text = data.get("text", "").strip()
+    text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"error": "Missing 'text' field"}), 400
 
@@ -173,25 +234,28 @@ def generate_avatar():
         return jsonify({"error": f"Invalid style '{style}' for character '{character}'. Valid: {AVATARS[character]}"}), 400
 
     try:
-        # 1. Submit Azure avatar job
-        job_id = create_avatar_job(text, voice=voice, character=character, style=style, background=background)
+        # 1) Submit Azure avatar job (auto SSML/plaintext)
+        job_id, input_kind_used = create_avatar_job(
+            text, voice=voice, character=character, style=style, background=background
+        )
 
-        # 2. Poll until done
+        # 2) Poll until done
         video_url = poll_avatar_job(job_id)
 
-        # 3. Download the video
+        # 3) Download the video
         local_path = download_file(video_url)
 
-        # 4. Upload to Cloudinary
+        # 4) Upload to Cloudinary
         cloudinary_url = upload_to_cloudinary(local_path)
 
-        # 5. Cleanup temp file
+        # 5) Cleanup temp file
         os.unlink(local_path)
 
         return jsonify({
             "success": True,
             "video_url": cloudinary_url,
             "job_id": job_id,
+            "inputKindUsed": input_kind_used,  # ✅ helpful debug
         })
 
     except TimeoutError as e:
